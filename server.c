@@ -1178,8 +1178,8 @@ static int main_loop(void)
 		}
 		if (initiate_lp_flush) {
 			initiate_lp_flush = false;
-			flush_lp_waiters();
 			fetch_new_work();
+			flush_lp_waiters();
 		}
 	}
 

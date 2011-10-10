@@ -39,6 +39,8 @@ struct work_src
 	unsigned char *merkle;
 	unsigned int merkle_len;
 	unsigned int script_off, script_len, ournonce_off;
+
+	unsigned int refcnt;
 };
 
 struct worker {
@@ -67,6 +69,27 @@ static const char *bc_err_str[] = {
 	[BC_ERR_WORK_REJECT] = "work submit rejected upstream",
 	[BC_ERR_INTERNAL] = "internal server err",
 };
+
+static struct work_src *work_src_alloc(void) {
+	struct work_src *work = calloc(1, sizeof(struct work_src));
+	work->coinbase = NULL;
+	work->merkle = NULL;
+	work->refcnt = 1;
+	return work;
+}
+
+static void work_src_incref(struct work_src *work) {
+	work->refcnt++;
+}
+
+static void work_src_decref(struct work_src *work) {
+	if(--(work->refcnt) == 0) {
+		free(work->coinbase);
+		free(work->merkle);
+		free(work);
+	}	
+}
+
 
 char *pwdb_lookup(const char *user)
 {
@@ -108,7 +131,8 @@ void worker_log_expire(time_t expire_time)
 	elist_for_each_entry_safe(ent, iter, &srv.work_log, srv_log_node) {
 		if (ent->timestamp > expire_time)
 			break;
-
+		if(ent->src != NULL)
+			work_src_decref(ent->src);
 		elist_del(&ent->srv_log_node);
 		elist_del(&ent->log_node);
 		free(ent);
@@ -142,6 +166,8 @@ static void worker_log(const char *username, const unsigned char *data,
 	memcpy(ent->data, data, sizeof(ent->data));
 	ent->timestamp = now;
 	ent->our_nonce = our_nonce;
+	if(src != NULL)
+		work_src_incref(src);
 	ent->src = src;
 	INIT_ELIST_HEAD(&ent->log_node);
 	INIT_ELIST_HEAD(&ent->srv_log_node);
@@ -278,6 +304,7 @@ static unsigned int rpcid = 1;
 
 static struct work_src *current_work = NULL;
 static uint32_t our_nonce_ctr = 0;
+static time_t current_work_expires = 0;
 
 static json_t *get_work(const char *auth_user)
 {
@@ -285,6 +312,9 @@ static json_t *get_work(const char *auth_user)
 	unsigned char data[128];
 	const char *data_str;
 	json_t *val, *result;
+
+	if(current_work != NULL && time(NULL) > current_work_expires)
+		fetch_new_work();
 
 	if(current_work != NULL && !srv.disable_lp && srv.easy_target) {
 		uint32_t our_nonce = our_nonce_ctr++;
@@ -379,22 +409,11 @@ static bool amend_coinbase(struct work_src *work)
 }
 
 // New, faster getworkex code that allows us to generate our own work
-bool fetch_new_work(void)
-{
-	if(srv.disable_lp) {
-		current_work = NULL;
-		return false;
-	} else {
-		current_work = get_work_ex();
-		return current_work != NULL;
-	}
-}
-
-struct work_src* get_work_ex(void)
+static struct work_src* get_work_ex(void)
 {
 	unsigned char data2[128];
 	char s[80]; unsigned int i;
-	struct work_src *work = malloc(sizeof(struct work_src));
+	struct work_src *work = work_src_alloc();
 	const char *data_str, *coinbase_str;
 	json_t *val, *result, *merkle_array;
 
@@ -414,13 +433,13 @@ struct work_src* get_work_ex(void)
 	if (!data_str || !coinbase_str || !merkle_array ||
 	    !hex2bin(work->data, data_str, sizeof(work->data))) {
 		json_decref(val);
-		free(work);
+		work_src_decref(work);
 		return NULL;
 	}
 	work->coinbase_len = hex2bin_dyn(&work->coinbase, coinbase_str);
 	if(work->coinbase_len == 0) {
 		json_decref(val);
-		free(work);
+		work_src_decref(work);
 		return NULL;
 	}
 	work->merkle_len = json_array_size(merkle_array);
@@ -429,9 +448,7 @@ struct work_src* get_work_ex(void)
 		data_str = json_string_value(json_array_get(merkle_array, i));
 		if(!data_str || !hex2bin(work->merkle+32*i, data_str, 32)) {
 			json_decref(val);
-			free(work->coinbase);
-			free(work->merkle);
-			free(work);
+			work_src_decref(work);
 			return NULL;
 		}
 	}
@@ -449,8 +466,24 @@ struct work_src* get_work_ex(void)
 
 	if(!amend_coinbase(work))
 		abort();
-	
+
+	json_decref(val);
 	return work;
+}
+
+bool fetch_new_work(void)
+{
+	printf("DEBUG: fetch new work\n");
+	if(current_work != NULL)
+		work_src_decref(current_work);
+	if(srv.disable_lp) {
+		current_work = NULL;
+		return false;
+	} else {
+		current_work = get_work_ex();
+		current_work_expires = time(NULL) + 5;
+		return current_work != NULL;
+	}
 }
 
 static int check_hash(const char *remote_host, const char *auth_user,

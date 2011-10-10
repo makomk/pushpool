@@ -216,7 +216,6 @@ extern struct hist *hist_alloc(void);
 extern bool hist_add(struct hist *hist, const unsigned char *hash);
 extern bool hist_lookup(struct hist *hist, const unsigned char *hash);
 extern bool fetch_new_work(void);
-extern struct work_src* get_work_ex(void);
 
 /* server.c */
 extern int debugging;
