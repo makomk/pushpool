@@ -306,6 +306,21 @@ static struct work_src *current_work = NULL;
 static uint32_t our_nonce_ctr = 0;
 static time_t current_work_expires = 0;
 
+static void calc_midstate(unsigned char *data, uint32_t *midstate_out)
+{
+	uint32_t data_fixed[16]; int i;
+	SHA256_CTX ctx;
+	SHA256_Init(&ctx);
+	memcpy(data_fixed, data, 64);
+	for(i = 0; i < 16; i++)
+		data_fixed[i] = bswap_32(data_fixed[i]);
+	SHA256_Update(&ctx, data_fixed, 64);
+	
+	// we can't use memcpy here because SHA_LONG may not be 32-bits
+	for(i = 0; i < 8; i++)
+		midstate_out[i] = ctx.h[i];
+}
+
 static json_t *get_work(const char *auth_user)
 {
 	char s[80];
@@ -318,6 +333,7 @@ static json_t *get_work(const char *auth_user)
 
 	if(current_work != NULL && !srv.disable_lp && srv.easy_target) {
 		uint32_t our_nonce = our_nonce_ctr++;
+		uint32_t midstate[8];
 		set_our_nonce(current_work, our_nonce);
 		rebuild_merkle_tree(current_work, data);
 
@@ -327,6 +343,12 @@ static json_t *get_work(const char *auth_user)
 		data_str = bin2hex(data, 128);
 		json_object_set_new(result, "data", json_string(data_str));
 		free(data_str);
+
+		calc_midstate(data, midstate);
+		data_str = bin2hex((unsigned char*)midstate, 32);
+		json_object_set_new(result, "midstate", json_string(data_str));
+		free(data_str);
+		json_object_set_new(result, "hash1", json_string("00000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000010000"));
 		json_object_set(result, "target", srv.easy_target);
 
 		/* log work unit as having been sent to associated worker */
