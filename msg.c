@@ -31,6 +31,16 @@
 #include <syslog.h>
 #include "server.h"
 
+struct work_src
+{
+	unsigned char data[128];
+	unsigned char *coinbase;
+	size_t coinbase_len;
+	unsigned char *merkle;
+	unsigned int merkle_len;
+	unsigned int script_off, script_len, ournonce_off;
+};
+
 struct worker {
 	char			username[64 + 1];
 
@@ -41,6 +51,8 @@ struct work_ent {
 	char			data[128];
 
 	time_t			timestamp;
+	uint32_t		our_nonce;
+	struct work_src*	src;
 
 	struct elist_head	log_node;
 	struct elist_head	srv_log_node;
@@ -103,7 +115,8 @@ void worker_log_expire(time_t expire_time)
 	}
 }
 
-static void worker_log(const char *username, const unsigned char *data)
+static void worker_log(const char *username, const unsigned char *data,
+                       uint32_t our_nonce, struct work_src *src)
 {
 	struct worker *worker;
 	struct work_ent *ent;
@@ -128,6 +141,8 @@ static void worker_log(const char *username, const unsigned char *data)
 
 	memcpy(ent->data, data, sizeof(ent->data));
 	ent->timestamp = now;
+	ent->our_nonce = our_nonce;
+	ent->src = src;
 	INIT_ELIST_HEAD(&ent->log_node);
 	INIT_ELIST_HEAD(&ent->srv_log_node);
 
@@ -137,7 +152,8 @@ static void worker_log(const char *username, const unsigned char *data)
 	worker_log_expire(now - srv.work_expire);
 }
 
-static const char *work_in_log(const char *username, const unsigned char *data)
+static const char *work_in_log(const char *username, const unsigned char *data,
+                               uint32_t *our_nonce_out, struct work_src **work_src_out)
 {
 	struct worker *worker;
 	struct work_ent *ent;
@@ -152,6 +168,9 @@ static const char *work_in_log(const char *username, const unsigned char *data)
 		 */
 		if (!memcmp(ent->data, data, 68) && !memcmp(ent->data + 72, data + 72, 4))
 		{
+			*our_nonce_out = ent->our_nonce;
+			*work_src_out = ent->src;
+
 			/* verify timestamp is within reasonable range
 			*/
 			uint32_t timestampSent = ntohl(*(uint32_t*)(ent->data + 68));
@@ -226,7 +245,39 @@ err_out:
 	return false;
 }
 
+// rebuilds the merkle tree and block header after modifying the coinbase
+static void rebuild_merkle_tree(struct work_src* work, unsigned char data_out[128])
+{
+	unsigned char merkle_buf[SHA256_DIGEST_LENGTH*2];
+	unsigned char hash[SHA256_DIGEST_LENGTH];
+	unsigned int i;
+	uint32_t *hash32 = (uint32_t *)merkle_buf;
+	memcpy(data_out, work->data, 128);
+	SHA256(work->coinbase, work->coinbase_len, hash);
+	SHA256(hash, SHA256_DIGEST_LENGTH, merkle_buf);
+	for(i = 0; i < work->merkle_len; i++) {
+		memcpy(merkle_buf+SHA256_DIGEST_LENGTH,
+		       work->merkle+i*SHA256_DIGEST_LENGTH,
+		       SHA256_DIGEST_LENGTH);
+		SHA256(merkle_buf, SHA256_DIGEST_LENGTH*2, hash);
+		SHA256(hash, SHA256_DIGEST_LENGTH, merkle_buf);
+	}
+	for(i = 0; i < 8; i++)
+		hash32[i] = bswap_32(hash32[i]);
+	memcpy(data_out+36, merkle_buf, SHA256_DIGEST_LENGTH);
+}
+
+// sets the value of the nonce added by amend_coinbase
+static void set_our_nonce(struct work_src* work, uint32_t our_nonce) {
+	union { uint32_t i; unsigned char c[4]; } u;
+	u.i = our_nonce;
+	memcpy(work->coinbase+work->ournonce_off, u.c, 4);
+}
+
 static unsigned int rpcid = 1;
+
+static struct work_src *current_work = NULL;
+static uint32_t our_nonce_ctr = 0;
 
 static json_t *get_work(const char *auth_user)
 {
@@ -235,7 +286,119 @@ static json_t *get_work(const char *auth_user)
 	const char *data_str;
 	json_t *val, *result;
 
-	sprintf(s, "{\"method\": \"getwork\", \"params\": [], \"id\":%u}\r\n",
+	if(current_work != NULL && !srv.disable_lp && srv.easy_target) {
+		uint32_t our_nonce = our_nonce_ctr++;
+		set_our_nonce(current_work, our_nonce);
+		rebuild_merkle_tree(current_work, data);
+
+		val = json_object();
+		result = json_object();
+		json_object_set_new(val, "result", result);
+		data_str = bin2hex(data, 128);
+		json_object_set_new(result, "data", json_string(data_str));
+		free(data_str);
+		json_object_set(result, "target", srv.easy_target);
+
+		/* log work unit as having been sent to associated worker */
+		worker_log(auth_user, data, our_nonce, current_work);
+	} else {
+		sprintf(s, "{\"method\": \"getwork\", \"params\": [], \"id\":%u}\r\n",
+			rpcid++);
+
+		/* issue JSON-RPC request */
+		val = json_rpc_call(srv.curl, srv.rpc_url, srv.rpc_userpass, s);
+		if (!val)
+			return NULL;
+
+		/* decode data field, implicitly verifying 'result' is an object */
+		result = json_object_get(val, "result");
+		data_str = json_string_value(json_object_get(result, "data"));
+		if (!data_str ||
+		    !hex2bin(data, data_str, sizeof(data))) {
+			json_decref(val);
+			return NULL;
+		}
+
+		if (memcmp(data + 4, srv.cur_prevhash, sizeof(srv.cur_prevhash)))
+		{
+			/* store two most recently seen prevhash (last, and current) */
+			memcpy(srv.last_prevhash, srv.cur_prevhash, sizeof(srv.last_prevhash));
+			memcpy(srv.cur_prevhash, data + 4, sizeof(srv.cur_prevhash));
+		}
+
+		/* log work unit as having been sent to associated worker */
+		worker_log(auth_user, data, 0, NULL);
+
+		/* rewrite target (pool server mode), if requested in config file */
+		if (srv.easy_target)
+			json_object_set(result, "target", srv.easy_target);
+	}
+	return val;
+}
+
+static const unsigned char expect_coinbase[41] = { 1, 0, 0, 0, 1 };
+
+// appends a new nonce to the coinbase that can be set by set_our_nonce
+static bool amend_coinbase(struct work_src *work)
+{
+	unsigned char *new_coinbase;
+	unsigned int script_end;
+
+	// validate coinbase looks as expected
+	if(work->coinbase_len < 47 || 
+	   memcmp(work->coinbase, expect_coinbase, sizeof(expect_coinbase) != 0))
+		return false;
+	if(work->coinbase[41] >= 0xfd)
+		return false;
+	work->script_off = 42;
+	work->script_len = work->coinbase[41];
+	script_end = work->script_off+work->script_len;
+	if(script_end >= work->coinbase_len)
+		return false;
+	
+	// check we have space to add another nonce without
+	// having to muck around with varints
+	if(work->script_len >= 0xfd-5)
+		return false;
+
+	// add the extra nonce at the end of scriptSig
+	new_coinbase = malloc(work->coinbase_len + 5);
+	memcpy(new_coinbase, work->coinbase, script_end);
+	memcpy(new_coinbase+script_end+5, work->coinbase+script_end,
+	       work->coinbase_len - script_end);
+	work->ournonce_off = script_end+1;
+	work->script_len += 5;
+	new_coinbase[41] = work->script_len;
+	new_coinbase[script_end] = 0x4;
+	memset(new_coinbase+script_end+1, 0, 4);
+	free(work->coinbase);
+	work->coinbase = new_coinbase;
+	work->coinbase_len += 5;
+	
+	return true;
+}
+
+// New, faster getworkex code that allows us to generate our own work
+bool fetch_new_work(void)
+{
+	if(srv.disable_lp) {
+		current_work = NULL;
+		return false;
+	} else {
+		current_work = get_work_ex();
+		return current_work != NULL;
+	}
+}
+
+struct work_src* get_work_ex(void)
+{
+	unsigned char data2[128];
+	char s[80]; unsigned int i;
+	struct work_src *work = malloc(sizeof(struct work_src));
+	const char *data_str, *coinbase_str;
+	json_t *val, *result, *merkle_array;
+
+	sprintf(s, "{\"method\": \"getworkex\", \"params\": [], \"id\":%u}\r\n",
 		rpcid++);
 
 	/* issue JSON-RPC request */
@@ -246,31 +409,53 @@ static json_t *get_work(const char *auth_user)
 	/* decode data field, implicitly verifying 'result' is an object */
 	result = json_object_get(val, "result");
 	data_str = json_string_value(json_object_get(result, "data"));
-	if (!data_str ||
-	    !hex2bin(data, data_str, sizeof(data))) {
+	coinbase_str = json_string_value(json_object_get(result, "coinbase"));
+	merkle_array = json_object_get(result, "merkle");
+	if (!data_str || !coinbase_str || !merkle_array ||
+	    !hex2bin(work->data, data_str, sizeof(work->data))) {
 		json_decref(val);
+		free(work);
 		return NULL;
 	}
+	work->coinbase_len = hex2bin_dyn(&work->coinbase, coinbase_str);
+	if(work->coinbase_len == 0) {
+		json_decref(val);
+		free(work);
+		return NULL;
+	}
+	work->merkle_len = json_array_size(merkle_array);
+	work->merkle = calloc(work->merkle_len, 32);
+	for(i = 0; i < work->merkle_len; i++) {
+		data_str = json_string_value(json_array_get(merkle_array, i));
+		if(!data_str || !hex2bin(work->merkle+32*i, data_str, 32)) {
+			json_decref(val);
+			free(work->coinbase);
+			free(work->merkle);
+			free(work);
+			return NULL;
+		}
+	}
 
-	if (memcmp(data + 4, srv.cur_prevhash, sizeof(srv.cur_prevhash)))
+	if (memcmp(work->data + 4, srv.cur_prevhash, sizeof(srv.cur_prevhash)))
 	{
 		/* store two most recently seen prevhash (last, and current) */
 		memcpy(srv.last_prevhash, srv.cur_prevhash, sizeof(srv.last_prevhash));
-		memcpy(srv.cur_prevhash, data + 4, sizeof(srv.cur_prevhash));
+		memcpy(srv.cur_prevhash, work->data + 4, sizeof(srv.cur_prevhash));
 	}
 
-	/* log work unit as having been sent to associated worker */
-	worker_log(auth_user, data);
+	rebuild_merkle_tree(work, data2);
+	if(memcmp(data2, work->data, 128) != 0)
+		abort();
 
-	/* rewrite target (pool server mode), if requested in config file */
-	if (srv.easy_target)
-		json_object_set(result, "target", srv.easy_target);
-
-	return val;
+	if(!amend_coinbase(work))
+		abort();
+	
+	return work;
 }
 
 static int check_hash(const char *remote_host, const char *auth_user,
-		      const char *data_str, const char **reason_out)
+		      const char *data_str, const char **reason_out,
+                      uint32_t *our_nonce_out, struct work_src **work_src_out)
 {
 	unsigned char hash[SHA256_DIGEST_LENGTH], hash1[SHA256_DIGEST_LENGTH];
 	uint32_t *hash32 = (uint32_t *) hash;
@@ -288,7 +473,7 @@ static int check_hash(const char *remote_host, const char *auth_user,
 	*reason_out = stale_work(data);
 	if (*reason_out)
 		return 0;		/* work is invalid */
-	*reason_out = work_in_log(auth_user, data);
+	*reason_out = work_in_log(auth_user, data, our_nonce_out, work_src_out);
 	if (*reason_out)
 		return 0;		/* work is invalid */
 
@@ -324,10 +509,12 @@ static bool submit_work(const char *remote_host, const char *auth_user,
 	char s[256 + 80];
 	bool rc = false;
 	int check_rc;
+	uint32_t our_nonce;
+	struct work_src *work = NULL;
 	*reason = NULL;
 
 	/* validate submitted work */
-	check_rc = check_hash(remote_host, auth_user, hexstr, reason);
+	check_rc = check_hash(remote_host, auth_user, hexstr, reason, &our_nonce, &work);
 	if (check_rc < 0)	/* internal failure */
 		goto out;
 	if (check_rc == 0) {	/* invalid hash */
@@ -344,16 +531,43 @@ static bool submit_work(const char *remote_host, const char *auth_user,
 		return true;
 	}
 
-	/* build JSON-RPC request */
-	sprintf(s,
-	      "{\"method\": \"getwork\", \"params\": [ \"%s\" ], \"id\":1}\r\n",
-		hexstr);
+	if(work)
+	{
+		char *hexstr_orig = bin2hex(work->data, 128);
+		char *coinbase_hex;
+		char *request_str;
+		set_our_nonce(work, our_nonce);
+		coinbase_hex = bin2hex(work->coinbase, work->coinbase_len);
+		request_str = malloc(80+256+work->coinbase_len*2);
+		
+		// copy across nTime and nonce
+		memcpy(hexstr_orig+136, hexstr+136, 24);
 
-	/* issue JSON-RPC request */
-	val = json_rpc_call(curl, srv.rpc_url, srv.rpc_userpass, s);
-	if (!val) {
-		applog(LOG_ERR, "submit_work json_rpc_call failed");
-		goto out;
+		sprintf(request_str, 
+		        "{\"method\": \"getworkex\", \"params\": [ \"%s\", \"%s\" ], \"id\":1}\r\n",
+		        hexstr_orig, coinbase_hex);
+
+		/* issue JSON-RPC request */
+		val = json_rpc_call(curl, srv.rpc_url, srv.rpc_userpass, request_str);
+		free(hexstr_orig);
+		free(coinbase_hex);
+		free(request_str);
+		if (!val) {
+			applog(LOG_ERR, "submit_work json_rpc_call failed");
+			goto out;
+		}
+	} else {
+		/* build JSON-RPC request */
+		sprintf(s,
+		      "{\"method\": \"getwork\", \"params\": [ \"%s\" ], \"id\":1}\r\n",
+			hexstr);
+		
+		/* issue JSON-RPC request */
+		val = json_rpc_call(curl, srv.rpc_url, srv.rpc_userpass, s);
+		if (!val) {
+			applog(LOG_ERR, "submit_work json_rpc_call failed");
+			goto out;
+		}
 	}
 
 	*reason = json_is_true(json_object_get(val, "result")) ? NULL : "unknown";

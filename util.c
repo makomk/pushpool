@@ -367,6 +367,23 @@ bool hex2bin(unsigned char *p, const char *hexstr, size_t len)
 	return (len == 0 && *hexstr == 0) ? true : false;
 }
 
+size_t hex2bin_dyn(unsigned char **pp, const char *hexstr)
+{
+	unsigned char *p;
+	size_t len = strlen(hexstr);
+	*pp = NULL;
+	if(len == 0 || len & 0x1)
+		return 0;
+	len /= 2;
+	
+	p = malloc(len);
+	if(hex2bin(p, hexstr, len)) {
+		*pp = p; return len;
+	} else {
+		free(p); return 0;
+	}
+}
+
 /* gbase64.c - Base64 encoding/decoding
  *
  *  Copyright (C) 2006 Alexander Larsson <alexl@redhat.com>

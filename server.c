@@ -1179,6 +1179,7 @@ static int main_loop(void)
 		if (initiate_lp_flush) {
 			initiate_lp_flush = false;
 			flush_lp_waiters();
+			fetch_new_work();
 		}
 	}
 
@@ -1297,6 +1298,8 @@ int main (int argc, char *argv[])
 		goto err_out_listen;
 
 	applog(LOG_INFO, "initialized");
+
+	fetch_new_work(); // FIXME - HACK
 
 	rc = main_loop();
 

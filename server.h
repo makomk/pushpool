@@ -68,6 +68,7 @@ typedef memcached_return memcached_return_t;
 #endif
 
 struct hist;
+struct work_src;
 
 struct client {
 	struct sockaddr_in6	addr;		/* inet address */
@@ -214,6 +215,8 @@ extern void hist_free(struct hist *hist);
 extern struct hist *hist_alloc(void);
 extern bool hist_add(struct hist *hist, const unsigned char *hash);
 extern bool hist_lookup(struct hist *hist, const unsigned char *hash);
+extern bool fetch_new_work(void);
+extern struct work_src* get_work_ex(void);
 
 /* server.c */
 extern int debugging;
@@ -241,6 +244,7 @@ extern json_t *json_rpc_call(CURL *curl, const char *url,
 		      const char *userpass, const char *rpc_req);
 extern char *bin2hex(unsigned char *p, size_t len);
 extern bool hex2bin(unsigned char *p, const char *hexstr, size_t len);
+extern size_t hex2bin_dyn(unsigned char **pp, const char *hexstr);
 extern unsigned char * g_base64_decode (const char *text, size_t *out_len);
 
 /* db-*.c */
