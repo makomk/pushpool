@@ -301,6 +301,53 @@ static void parse_database(const json_t *db_obj)
 		srv.db_stmt_sharelog = strdup(db_st_sharelog);
 }
 
+static void parse_auxchains(const json_t *auxchains)
+{
+	int i, len;
+
+	len = json_array_size(auxchains);
+
+	for (i = 0; i < len; i++) {
+		json_t *obj;
+		const char *rpcuser, *rpcpass, *rpcurl;
+		struct server_auxchain *aux;
+
+		obj = json_array_get(auxchains, i);
+
+		rpcurl = json_string_value(json_object_get(obj, "rpc.url"));
+		if (!rpcurl) {
+			applog(LOG_ERR, "error: no RPC URL specified");
+			exit(1);
+		}
+
+		rpcuser = json_string_value(json_object_get(obj, "rpc.user"));
+		rpcpass = json_string_value(json_object_get(obj, "rpc.pass"));
+		if (!rpcuser || !rpcpass) {
+			applog(LOG_ERR, "error: no RPC user and/or password specified for aux chain");
+			exit(1);
+		}
+
+		aux = calloc(1, sizeof(*aux));
+		if (!aux) {
+			applog(LOG_ERR, "OOM");
+			exit(1);
+		}
+
+		aux->rpc_url = strdup(rpcurl);
+
+		if (asprintf(&aux->rpc_userpass, "%s:%s", rpcuser, rpcpass) < 0) {
+			applog(LOG_ERR, "OOM");
+			exit(1);
+		}
+		
+
+		INIT_ELIST_HEAD(&aux->auxchains_node);
+
+		elist_add_tail(&aux->auxchains_node, &srv.auxchains);
+	}
+}
+
+
 void read_config(void)
 {
 	json_t *jcfg, *cred_expire, *tmp_json;
@@ -329,6 +376,7 @@ void read_config(void)
 	parse_listen(json_object_get(jcfg, "listen"));
 	parse_database(json_object_get(jcfg, "database"));
 	parse_memcached(json_object_get(jcfg, "memcached"));
+	parse_auxchains(json_object_get(jcfg, "auxchains"));
 
 	if (elist_empty(&srv.listeners)) {
 		applog(LOG_ERR, "error: no listen addresses specified");

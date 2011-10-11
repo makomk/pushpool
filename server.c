@@ -1196,6 +1196,7 @@ int main (int argc, char *argv[])
 	INIT_ELIST_HEAD(&srv.sockets);
 	INIT_ELIST_HEAD(&srv.work_log);
 	INIT_ELIST_HEAD(&srv.lp_waiters);
+	INIT_ELIST_HEAD(&srv.auxchains);
 
 	/* isspace() and strcasecmp() consistency requires this */
 	setlocale(LC_ALL, "C");
@@ -1299,7 +1300,10 @@ int main (int argc, char *argv[])
 
 	applog(LOG_INFO, "initialized");
 
-	fetch_new_work(); // FIXME - HACK
+        if(!fetch_new_work() && !elist_empty(&srv.listeners)) {
+		applog(LOG_ERR, "error: using aux chains but getworkex not available");
+		exit(1);
+	}
 
 	rc = main_loop();
 

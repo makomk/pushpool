@@ -31,14 +31,26 @@
 #include <syslog.h>
 #include "server.h"
 
+struct work_aux;
+
 struct work_src
 {
 	unsigned char data[128];
 	unsigned char *coinbase;
 	size_t coinbase_len;
 	unsigned char *merkle;
+	struct work_aux **auxworks;
 	unsigned int merkle_len;
 	unsigned int script_off, script_len, ournonce_off;
+
+	unsigned int refcnt;
+};
+
+struct work_aux
+{
+	unsigned char hash[32];
+	struct server_auxchain *aux;
+	int32_t chain_id;
 
 	unsigned int refcnt;
 };
@@ -70,6 +82,24 @@ static const char *bc_err_str[] = {
 	[BC_ERR_INTERNAL] = "internal server err",
 };
 
+static struct work_aux *work_aux_alloc(struct server_auxchain *aux) {
+	struct work_aux *work = calloc(1, sizeof(struct work_aux));
+	work->aux = aux;
+	work->refcnt = 1;
+	return work;
+}
+
+static void work_aux_incref(struct work_aux *work) {
+	work->refcnt++;
+}
+
+static void work_aux_decref(struct work_aux *work) {
+	if(--(work->refcnt) == 0) {
+		free(work);
+	}	
+}
+
+
 static struct work_src *work_src_alloc(void) {
 	struct work_src *work = calloc(1, sizeof(struct work_src));
 	work->coinbase = NULL;
@@ -84,6 +114,12 @@ static void work_src_incref(struct work_src *work) {
 
 static void work_src_decref(struct work_src *work) {
 	if(--(work->refcnt) == 0) {
+		if(work->auxworks) {
+			struct work_aux **pauxwork;
+			for(pauxwork = work->auxworks; *pauxwork != NULL; pauxwork++)
+				work_aux_decref(*pauxwork);
+			free(work->auxworks);
+		}
 		free(work->coinbase);
 		free(work->merkle);
 		free(work);
@@ -390,11 +426,15 @@ static json_t *get_work(const char *auth_user)
 
 static const unsigned char expect_coinbase[41] = { 1, 0, 0, 0, 1 };
 
+static const unsigned char pchMergedMiningHeader[] = { 0xfa, 0xbe, 'm', 'm' } ;
+
 // appends a new nonce to the coinbase that can be set by set_our_nonce
-static bool amend_coinbase(struct work_src *work)
+static bool amend_coinbase(struct work_src *work, unsigned char *auxmerkleroot,
+                           uint32_t auxmerklesize, uint32_t auxmerklenonce)
 {
 	unsigned char *new_coinbase;
 	unsigned int script_end;
+	unsigned int size_increase = auxmerklesize > 0 ? (46 + 5) : 5;
 
 	// validate coinbase looks as expected
 	if(work->coinbase_len < 47 || 
@@ -410,22 +450,37 @@ static bool amend_coinbase(struct work_src *work)
 	
 	// check we have space to add another nonce without
 	// having to muck around with varints
-	if(work->script_len >= 0xfd-5)
+	if(work->script_len >= 0xfd-size_increase)
 		return false;
 
-	// add the extra nonce at the end of scriptSig
-	new_coinbase = malloc(work->coinbase_len + 5);
+	// prepare to add the extra data at the end of scriptSig
+	new_coinbase = malloc(work->coinbase_len + size_increase);
 	memcpy(new_coinbase, work->coinbase, script_end);
-	memcpy(new_coinbase+script_end+5, work->coinbase+script_end,
+	memcpy(new_coinbase+script_end+size_increase, work->coinbase+script_end,
 	       work->coinbase_len - script_end);
 	work->ournonce_off = script_end+1;
-	work->script_len += 5;
+	work->script_len += size_increase;
 	new_coinbase[41] = work->script_len;
+
+	if(auxmerklesize > 0) {
+		// add the merged mining data
+		new_coinbase[script_end] = 82; // OP_2
+		new_coinbase[script_end+1] = 44; // length of MM data
+		memcpy(new_coinbase+script_end+2, pchMergedMiningHeader, 4);
+		memcpy(new_coinbase+script_end+6, auxmerkleroot, 32);
+		memcpy(new_coinbase+script_end+38, &auxmerklesize, 4);
+		memcpy(new_coinbase+script_end+42, &auxmerklenonce, 4);
+		script_end += 46;
+	}
+
+	// add the extranonce
 	new_coinbase[script_end] = 0x4;
 	memset(new_coinbase+script_end+1, 0, 4);
+	
+	// replace the coinbase with the amended version
 	free(work->coinbase);
 	work->coinbase = new_coinbase;
-	work->coinbase_len += 5;
+	work->coinbase_len += size_increase;
 	
 	return true;
 }
@@ -486,12 +541,43 @@ static struct work_src* get_work_ex(void)
 	if(memcmp(data2, work->data, 128) != 0)
 		abort();
 
-	if(!amend_coinbase(work))
-		abort();
-
 	json_decref(val);
 	return work;
 }
+
+static struct work_aux* get_aux_block(struct server_auxchain *aux)
+{
+	//unsigned char block_hash[32];
+	char s[80]; unsigned int i;
+	struct work_aux *auxwork = work_aux_alloc(aux);
+	const char *target_str, *hash_str;
+	json_t *val, *result;
+
+	sprintf(s, "{\"method\": \"getauxblock\", \"params\": [], \"id\":%u}\r\n",
+		rpcid++);
+
+	/* issue JSON-RPC request */
+	val = json_rpc_call(srv.curl, aux->rpc_url, aux->rpc_userpass, s);
+	if (!val)
+		return NULL;
+
+	/* decode data field, implicitly verifying 'result' is an object */
+	result = json_object_get(val, "result");
+	target_str = json_string_value(json_object_get(result, "target"));
+	hash_str = json_string_value(json_object_get(result, "hash"));
+	auxwork->chain_id = json_integer_value(json_object_get(result, "chainid"));
+	if (!target_str || !hash_str ||
+	    !hex2bin(auxwork->hash, hash_str, sizeof(auxwork->hash))) {
+		json_decref(val);
+		work_aux_decref(auxwork);
+		return NULL;
+	}
+	
+	json_decref(val);
+	return auxwork;
+}
+
+static int need_merkle_relayout = 1;
 
 bool fetch_new_work(void)
 {
@@ -502,9 +588,56 @@ bool fetch_new_work(void)
 		current_work = NULL;
 		return false;
 	} else {
+		struct elist_head *tmpl;
+		unsigned int num_chains = 0;
+		int success = true;
+		unsigned char auxmerkleroot[32];
+
 		current_work = get_work_ex();
 		current_work_expires = time(NULL) + 5;
-		return current_work != NULL;
+		if(current_work == NULL)
+			return false;
+
+		elist_for_each(tmpl, &srv.auxchains)
+			num_chains++;
+
+		if(num_chains > 0) {
+			current_work->auxworks = calloc(num_chains+1, sizeof(struct work_aux**));
+		}
+
+		num_chains = 0;
+		elist_for_each(tmpl, &srv.auxchains) {
+			struct server_auxchain *aux;
+			struct work_aux* auxwork;
+
+			aux = elist_entry(tmpl, struct server_auxchain, auxchains_node);
+			auxwork = get_aux_block(aux);
+
+			if(!auxwork) {
+				success = false; continue;
+			}
+
+			if(aux->chain_id != auxwork->chain_id) {
+				aux->chain_id = auxwork->chain_id;
+				need_merkle_relayout = 1;
+			}
+			current_work->auxworks[num_chains++] = auxwork;
+		}
+
+		// FIXME - need to support more than one chain!
+		if(num_chains > 1)
+			abort();
+		
+		if(num_chains == 1)
+			memcpy(auxmerkleroot, current_work->auxworks[0]->hash, 32);
+
+		if(!amend_coinbase(current_work, auxmerkleroot, num_chains, 0)) {
+			work_src_decref(current_work);
+			current_work = NULL;
+			return false;
+		}
+
+		return success;
 	}
 }
 

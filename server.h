@@ -138,6 +138,18 @@ enum server_db_eng {
 	SDB_POSTGRESQL,
 };
 
+struct server_auxchain {
+	char			*rpc_url;
+	char			*rpc_userpass;
+	char			*db_stmt_auxsharelog;
+
+	int32_t			chain_id;
+	unsigned char		last_prevhash[32];
+	unsigned char		cur_prevhash[32];
+
+	struct elist_head	auxchains_node;
+};
+
 struct server {
 	unsigned long		flags;		/* SFL_xxx above */
 
@@ -190,6 +202,8 @@ struct server {
 	bool			disable_roll_ntime;
 
 	memcached_st		*mc;
+
+	struct elist_head	auxchains;
 
 	struct elist_head	listeners;
 	struct elist_head	sockets;	/* points into listeners */
