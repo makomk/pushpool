@@ -625,6 +625,7 @@ bool fetch_new_work(void)
 		}
 
 		// FIXME - need to support more than one chain!
+		// (NOTE: also need to change submit_work_aux if you fix this.)
 		if(num_chains > 1)
 			abort();
 		
@@ -643,46 +644,46 @@ bool fetch_new_work(void)
 
 static int check_hash(const char *remote_host, const char *auth_user,
 		      const char *data_str, const char **reason_out,
-                      uint32_t *our_nonce_out, struct work_src **work_src_out)
+                      uint32_t *our_nonce_out, struct work_src **work_src_out,
+                      unsigned char *data_out, unsigned char *blockhash_out)
 {
-	unsigned char hash[SHA256_DIGEST_LENGTH], hash1[SHA256_DIGEST_LENGTH];
-	uint32_t *hash32 = (uint32_t *) hash;
-	unsigned char data[128];
-	uint32_t *data32 = (uint32_t *) data;
+	unsigned char hash1[SHA256_DIGEST_LENGTH];
+	uint32_t *hash32 = (uint32_t *) blockhash_out;
+	uint32_t *data32 = (uint32_t *) data_out;
 	bool rc, better_hash = false;
 	int i;
 
-	rc = hex2bin(data, data_str, sizeof(data));
+	rc = hex2bin(data_out, data_str, 128);
 	if (!rc) {
 		applog(LOG_ERR, "check_hash hex2bin failed");
 		return -1;		/* error; failure */
 	}
 
-	*reason_out = stale_work(data);
+	*reason_out = stale_work(data_out);
 	if (*reason_out)
 		return 0;		/* work is invalid */
-	*reason_out = work_in_log(auth_user, data, our_nonce_out, work_src_out);
+	*reason_out = work_in_log(auth_user, data_out, our_nonce_out, work_src_out);
 	if (*reason_out)
 		return 0;		/* work is invalid */
 
 	for (i = 0; i < 128/4; i++)
 		data32[i] = bswap_32(data32[i]);
 
-	SHA256(data, 80, hash1);
-	SHA256(hash1, SHA256_DIGEST_LENGTH, hash);
+	SHA256(data_out, 80, hash1);
+	SHA256(hash1, SHA256_DIGEST_LENGTH, blockhash_out);
 
 	if (hash32[7] != 0) {
 		*reason_out = "H-not-zero";
 		return 0;		/* work is invalid */
 	}
-	if (hash[27] == 0)
+	if (blockhash_out[27] == 0)
 		better_hash = true;
 
-	if (hist_lookup(srv.hist, hash)) {
+	if (hist_lookup(srv.hist, blockhash_out)) {
 		*reason_out = "duplicate";
 		return 0;		/* work is invalid */
 	}
-	if (!hist_add(srv.hist, hash)) {
+	if (!hist_add(srv.hist, blockhash_out)) {
 		applog(LOG_ERR, "hist_add OOM");
 		return -1;		/* error; failure */
 	}
@@ -690,10 +691,71 @@ static int check_hash(const char *remote_host, const char *auth_user,
 	return better_hash ? 2 : 1;			/* work is valid */
 }
 
+static bool submit_work_aux(const char *remote_host, const char *auth_user,
+                            CURL *curl, const char *hexstr, 
+                            struct work_src *work, struct work_aux *auxwork,
+                            unsigned char *data, unsigned char *blockhash)
+{
+	json_t *val;
+	char *request_str, *auxblock_hex, *auxpow_hex;
+	unsigned char* auxpow, *p;
+	unsigned int auxpow_len = work->coinbase_len + 32 + 1 + 32*work->merkle_len +
+		4 + 1 /* + 32*aux_merkle_len */ + 4 + 80;
+	if(work->merkle_len > 32) 
+		return false;
+
+	// FIXME - need to log work & detect stale work here. Somehow.
+	
+	auxpow = malloc(auxpow_len);
+	memcpy(auxpow, work->coinbase, work->coinbase_len);
+	p = auxpow + work->coinbase_len;
+	memcpy(p, blockhash, 32); // parent block's hash
+	p[32] = work->merkle_len;
+	p += 33;
+	memcpy(p, work->merkle, 32*work->merkle_len);
+	p += 32*work->merkle_len;
+	memset(p, 0, 4); // index of coinbase TX, currently always 0
+	p[4] = 0; // FIXME: aux chain merkle branch length
+	// FIXME: aux chain merkle branch goes here
+	memset(p+5, 0, 4); // FIXME: aux chain merkle index goes here
+	memcpy(p+9, data, 80); // parent block
+	
+	auxpow_hex = bin2hex(auxpow, auxpow_len);
+	free(auxpow);
+
+	auxblock_hex = bin2hex(auxwork->hash, 32);
+
+	request_str = malloc(80+256+auxpow_len*2);
+	sprintf(request_str, 
+	        "{\"method\": \"getauxblock\", \"params\": [ \"%s\", \"%s\" ], \"id\":1}\r\n",
+	        auxblock_hex, auxpow_hex);
+
+	/* issue JSON-RPC request */
+	val = json_rpc_call(curl, auxwork->aux->rpc_url, auxwork->aux->rpc_userpass,
+	                   request_str);
+	free(auxblock_hex);
+	free(auxpow_hex);
+	free(request_str);
+	
+	if (!val) {
+		applog(LOG_ERR, "submit_work_aux json_rpc_call failed");
+		goto out;
+	}
+
+	// FIXME - check return code
+
+	json_decref(val);
+
+out:
+	return false; // FIXME
+}
+
 static bool submit_work(const char *remote_host, const char *auth_user,
 			CURL *curl, const char *hexstr, const char **reason)
 {
 	json_t *val;
+	unsigned char data[128];
+	unsigned char blockhash[SHA256_DIGEST_LENGTH];
 	char s[256 + 80];
 	bool rc = false;
 	int check_rc;
@@ -702,7 +764,8 @@ static bool submit_work(const char *remote_host, const char *auth_user,
 	*reason = NULL;
 
 	/* validate submitted work */
-	check_rc = check_hash(remote_host, auth_user, hexstr, reason, &our_nonce, &work);
+	check_rc = check_hash(remote_host, auth_user, hexstr, reason, &our_nonce, &work,
+	                      data, blockhash);
 	if (check_rc < 0)	/* internal failure */
 		goto out;
 	if (check_rc == 0) {	/* invalid hash */
@@ -740,6 +803,15 @@ static bool submit_work(const char *remote_host, const char *auth_user,
 		free(hexstr_orig);
 		free(coinbase_hex);
 		free(request_str);
+		
+		// FIXME - we should submit work to aux even if it's stale on main
+		if(work->auxworks) {
+			struct work_aux **pauxwork;
+			for(pauxwork = work->auxworks; *pauxwork != NULL; pauxwork++)
+				submit_work_aux(remote_host, auth_user, curl, hexstr,
+                                                work, *pauxwork, data, blockhash);
+		}
+
 		if (!val) {
 			applog(LOG_ERR, "submit_work json_rpc_call failed");
 			goto out;
