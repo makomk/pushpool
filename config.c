@@ -309,7 +309,7 @@ static void parse_auxchains(const json_t *auxchains)
 
 	for (i = 0; i < len; i++) {
 		json_t *obj;
-		const char *rpcuser, *rpcpass, *rpcurl;
+		const char *rpcuser, *rpcpass, *rpcurl, *st_sharelog;
 		struct server_auxchain *aux;
 
 		obj = json_array_get(auxchains, i);
@@ -327,6 +327,12 @@ static void parse_auxchains(const json_t *auxchains)
 			exit(1);
 		}
 
+		st_sharelog = json_string_value(json_object_get(obj, "stmt.sharelog"));
+		if(srv.db_sharelog && !st_sharelog) {
+			applog(LOG_ERR, "error: no share logging statement specified for alt chain");
+			exit(1);
+		}
+
 		aux = calloc(1, sizeof(*aux));
 		if (!aux) {
 			applog(LOG_ERR, "OOM");
@@ -339,6 +345,9 @@ static void parse_auxchains(const json_t *auxchains)
 			applog(LOG_ERR, "OOM");
 			exit(1);
 		}
+
+		if(st_sharelog)
+			aux->db_stmt_auxsharelog = strdup(st_sharelog);
 		
 
 		INIT_ELIST_HEAD(&aux->auxchains_node);

@@ -76,20 +76,28 @@ out:
 	return pw;
 }
 
-static bool pg_sharelog(const char *rem_host, const char *username,
+static bool pg_sharelog(struct server_auxchain *aux,
+			const char *rem_host, const char *username,
 			const char *our_result,
 			const char *upstream_result, const char *reason,
 			const char *solution)
 {
 	PGresult *res;
+	const char *stmt_sharelog = aux ? aux->db_stmt_auxsharelog : srv.db_stmt_sharelog;
 	/* PG does a fine job with timestamps so we won't bother. */
 	const char *paramvalues[] = { rem_host, username, our_result,
 		upstream_result, reason, solution
 	};
 	if (!pg_conncheck())
 		return false;
+
+	if(!stmt_sharelog) {
+	  	applog(LOG_ERR, "pg sharelog failed due to missing statement");
+		return false;
+	}	
+	
 	res =
-	    PQexecParams(srv.db_cxn, srv.db_stmt_sharelog, 6, NULL,
+	    PQexecParams(srv.db_cxn, stmt_sharelog, 6, NULL,
 			 paramvalues, NULL, NULL, 0);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 		applog(LOG_ERR, "pg_sharelog failed: %s",

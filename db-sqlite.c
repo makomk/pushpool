@@ -80,7 +80,8 @@ err_out:
 	return NULL;
 }
 
-static bool sql_sharelog(const char *rem_host, const char *username,
+static bool sql_sharelog(struct server_auxchain *aux,
+			 const char *rem_host, const char *username,
 			 const char *our_result, const char *upstream_result,
 			 const char *reason, const char *solution)
 {
@@ -91,10 +92,16 @@ static bool sql_sharelog(const char *rem_host, const char *username,
 		our_result, upstream_result,
 		reason, solution
 	};
+	const char *stmt_sharelog = aux ? aux->db_stmt_auxsharelog : srv.db_stmt_sharelog;
+
+	if(!stmt_sharelog) {
+	  	applog(LOG_ERR, "sqlite sharelog failed due to missing statement");
+		return false;
+	}	
 
 	gettimeofday(&tv, NULL);
 
-	rc = sqlite3_prepare_v2(srv.db_cxn, srv.db_stmt_sharelog,
+	rc = sqlite3_prepare_v2(srv.db_cxn, stmt_sharelog,
 				-1, &stmt, NULL);
 	if (rc != SQLITE_OK) {
 		applog(LOG_ERR, "sql_sharelog(prepare) failed: %s",

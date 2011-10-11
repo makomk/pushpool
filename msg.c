@@ -49,6 +49,7 @@ struct work_src
 struct work_aux
 {
 	unsigned char hash[32];
+	unsigned char prevhash[32];
 	struct server_auxchain *aux;
 	int32_t chain_id;
 
@@ -550,7 +551,7 @@ static struct work_aux* get_aux_block(struct server_auxchain *aux)
 	//unsigned char block_hash[32];
 	char s[80]; unsigned int i;
 	struct work_aux *auxwork = work_aux_alloc(aux);
-	const char *target_str, *hash_str;
+	const char *target_str, *hash_str, *prevhash_str;
 	json_t *val, *result;
 
 	sprintf(s, "{\"method\": \"getauxblock\", \"params\": [], \"id\":%u}\r\n",
@@ -565,12 +566,21 @@ static struct work_aux* get_aux_block(struct server_auxchain *aux)
 	result = json_object_get(val, "result");
 	target_str = json_string_value(json_object_get(result, "target"));
 	hash_str = json_string_value(json_object_get(result, "hash"));
+	prevhash_str = json_string_value(json_object_get(result, "prevhash"));
 	auxwork->chain_id = json_integer_value(json_object_get(result, "chainid"));
-	if (!target_str || !hash_str ||
-	    !hex2bin(auxwork->hash, hash_str, sizeof(auxwork->hash))) {
+	if (!target_str || !hash_str || !prevhash_str ||
+	    !hex2bin(auxwork->hash, hash_str, sizeof(auxwork->hash)) ||
+	    !hex2bin(auxwork->prevhash, prevhash_str, sizeof(auxwork->prevhash))) {
 		json_decref(val);
 		work_aux_decref(auxwork);
 		return NULL;
+	}
+
+	if (memcmp(auxwork->prevhash, aux->cur_prevhash, sizeof(aux->cur_prevhash)))
+	{
+		/* store two most recently seen prevhash (last, and current) */
+		memcpy(aux->last_prevhash, aux->cur_prevhash, sizeof(aux->last_prevhash));
+		memcpy(aux->cur_prevhash, auxwork->prevhash, sizeof(aux->cur_prevhash));
 	}
 	
 	json_decref(val);
@@ -694,18 +704,33 @@ static int check_hash(const char *remote_host, const char *auth_user,
 static bool submit_work_aux(const char *remote_host, const char *auth_user,
                             CURL *curl, const char *hexstr, 
                             struct work_src *work, struct work_aux *auxwork,
-                            unsigned char *data, unsigned char *blockhash)
+                            unsigned char *data, unsigned char *blockhash,
+	                    int check_rc)
 {
-	json_t *val;
+	json_t *val; int is_success = 0;
 	char *request_str, *auxblock_hex, *auxpow_hex;
 	unsigned char* auxpow, *p;
 	unsigned int auxpow_len = work->coinbase_len + 32 + 1 + 32*work->merkle_len +
 		4 + 1 /* + 32*aux_merkle_len */ + 4 + 80;
 	if(work->merkle_len > 32) 
 		return false;
-
-	// FIXME - need to log work & detect stale work here. Somehow.
 	
+	if (memcmp(auxwork->prevhash, auxwork->aux->cur_prevhash,
+	           sizeof(auxwork->prevhash))) {
+		/* FIXME - check against last_prevhash for more accurate reason */
+		sharelog(auxwork->aux, remote_host, auth_user, "N", NULL, "prevhash", hexstr);
+		return false;
+	}
+
+
+	/* if hash is sufficient for share, but not target,
+	 * don't bother submitting to bitcoind
+	 */
+	if (srv.easy_target && check_rc == 1) {
+		sharelog(auxwork->aux, remote_host, auth_user, "Y", NULL, NULL, hexstr);
+		return true;
+	}
+
 	auxpow = malloc(auxpow_len);
 	memcpy(auxpow, work->coinbase, work->coinbase_len);
 	p = auxpow + work->coinbase_len;
@@ -742,12 +767,19 @@ static bool submit_work_aux(const char *remote_host, const char *auth_user,
 		goto out;
 	}
 
-	// FIXME - check return code
+	is_success = json_is_true(json_object_get(val, "result"));
+
+	sharelog(auxwork->aux, remote_host, auth_user,
+		 srv.easy_target ? "Y" : is_success ? "Y" : "N",
+		 is_success ? "Y" : "N", NULL, hexstr);
+
+	if(srv.easy_target)
+		is_success = 1;
 
 	json_decref(val);
 
 out:
-	return false; // FIXME
+	return is_success;
 }
 
 static bool submit_work(const char *remote_host, const char *auth_user,
@@ -769,8 +801,24 @@ static bool submit_work(const char *remote_host, const char *auth_user,
 	if (check_rc < 0)	/* internal failure */
 		goto out;
 	if (check_rc == 0) {	/* invalid hash */
-		sharelog(remote_host, auth_user, "N", NULL, *reason, hexstr);
+		sharelog(NULL, remote_host, auth_user, "N", NULL, *reason, hexstr);
+		if(work && work->auxworks) {
+			struct work_aux **pauxwork;
+			for(pauxwork = work->auxworks; *pauxwork != NULL; pauxwork++)
+				sharelog((*pauxwork)->aux, remote_host, auth_user,
+					 "N", NULL, *reason, hexstr);
+		}
 		return true;
+	}
+
+	/* try submitting work to any aux chains */
+	/* FIXME: we want to do this even if it's stale on the main chain */
+	if(work && work->auxworks) {
+		struct work_aux **pauxwork;
+		for(pauxwork = work->auxworks; *pauxwork != NULL; pauxwork++)
+			submit_work_aux(remote_host, auth_user, curl, hexstr,
+					work, *pauxwork, data, blockhash,
+				        check_rc);
 	}
 
 	/* if hash is sufficient for share, but not target,
@@ -778,9 +826,10 @@ static bool submit_work(const char *remote_host, const char *auth_user,
 	 */
 	if (srv.easy_target && check_rc == 1) {
 		*reason = NULL;
-		sharelog(remote_host, auth_user, "Y", NULL, NULL, hexstr);
+		sharelog(NULL, remote_host, auth_user, "Y", NULL, NULL, hexstr);
 		return true;
 	}
+
 
 	if(work)
 	{
@@ -804,14 +853,6 @@ static bool submit_work(const char *remote_host, const char *auth_user,
 		free(coinbase_hex);
 		free(request_str);
 		
-		// FIXME - we should submit work to aux even if it's stale on main
-		if(work->auxworks) {
-			struct work_aux **pauxwork;
-			for(pauxwork = work->auxworks; *pauxwork != NULL; pauxwork++)
-				submit_work_aux(remote_host, auth_user, curl, hexstr,
-                                                work, *pauxwork, data, blockhash);
-		}
-
 		if (!val) {
 			applog(LOG_ERR, "submit_work json_rpc_call failed");
 			goto out;
@@ -833,7 +874,7 @@ static bool submit_work(const char *remote_host, const char *auth_user,
 	*reason = json_is_true(json_object_get(val, "result")) ? NULL : "unknown";
 	rc = true;
 
-	sharelog(remote_host, auth_user,
+	sharelog(NULL, remote_host, auth_user,
 		 srv.easy_target ? "Y" : *reason ? "N" : "Y",
 		 *reason ? "N" : "Y", NULL, hexstr);
 

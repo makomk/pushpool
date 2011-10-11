@@ -69,6 +69,7 @@ typedef memcached_return memcached_return_t;
 
 struct hist;
 struct work_src;
+struct server_auxchain;
 
 struct client {
 	struct sockaddr_in6	addr;		/* inet address */
@@ -125,7 +126,8 @@ struct genlist {
 
 struct server_db_ops {
 	char	* (*pwdb_lookup)(const char *user);
-	bool	(*sharelog)(const char *rem_host, const char *username,
+	bool	(*sharelog)(struct server_auxchain *aux,
+			    const char *rem_host, const char *username,
 			    const char *our_result, const char *upstream_result,
 			    const char *reason, const char *solution);
 	bool	(*open)(void);
@@ -235,7 +237,8 @@ extern bool fetch_new_work(void);
 extern int debugging;
 extern bool use_syslog;
 extern struct server srv;
-extern void sharelog(const char *rem_host, const char *username,
+extern void sharelog(struct server_auxchain *aux,
+		     const char *rem_host, const char *username,
 		     const char *, const char *,
 		     const char *, const char *);
 extern bool cjson_encode(unsigned char op, const char *obj_unc,

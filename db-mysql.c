@@ -126,7 +126,8 @@ err_out:
 	return NULL;
 }
 
-static bool my_sharelog(const char *rem_host, const char *username,
+static bool my_sharelog(struct server_auxchain *aux,
+			const char *rem_host, const char *username,
 			const char *our_result, const char *upstream_result,
 			const char *reason, const char *solution)
 {
@@ -136,6 +137,12 @@ static bool my_sharelog(const char *rem_host, const char *username,
 	unsigned long bind_lengths[6];
 	bool rc = false;
 	const char *step = "init";
+	const char *stmt_sharelog = aux ? aux->db_stmt_auxsharelog : srv.db_stmt_sharelog;
+
+	if(!stmt_sharelog) {
+	  	applog(LOG_ERR, "mysql sharelog failed due to missing statement");
+		return false;
+	}
 
 	stmt = mysql_stmt_init(db);
 	if (!stmt)
@@ -151,8 +158,8 @@ static bool my_sharelog(const char *rem_host, const char *username,
 	bind_instr(bind_param, bind_lengths, 5, solution);
 
 	step = "prep";
-	if (mysql_stmt_prepare(stmt, srv.db_stmt_sharelog,
-			       strlen(srv.db_stmt_sharelog)))
+	if (mysql_stmt_prepare(stmt, stmt_sharelog,
+			       strlen(stmt_sharelog)))
 		goto err_out;
 
 	step = "bind-param";
