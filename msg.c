@@ -44,7 +44,7 @@ struct work_src
 	unsigned int script_off, script_len, ournonce_off;
 
 	unsigned char *aux_merkle;
-	unsigned int aux_merkle_len;
+	unsigned int aux_merkle_depth;
 	uint32_t aux_merkle_nonce;
 
 	unsigned int refcnt;
@@ -594,27 +594,49 @@ static struct work_aux* get_aux_block(struct server_auxchain *aux)
 }
 
 static int need_merkle_relayout = 1;
-uint32_t aux_merkle_nonce;
-unsigned int num_merkle_slots;
+uint32_t aux_merkle_nonce = 0;
+unsigned int aux_merkle_depth = 0;
 
 
-uint32_t calc_chain_merkle_slot(uint32_t nonce, uint32_t chain_id)
+static uint32_t calc_merkle_slot_namecoin(uint32_t nonce, uint32_t chain_id)
 {
 	uint32_t n = nonce * 1103515245 + 12345 + chain_id;
 	return n * 1103515245 + 12345;
 }
 
+#define lrot(x,n) (((x) << (n)) | ((x) >> (32-(n))))
+
+static uint32_t calc_merkle_slot_bob(uint32_t nonce, uint32_t chain_id)
+{
+	uint32_t n = (0xdeadbeef ^ chain_id) - lrot(chain_id, 14);
+	nonce = (nonce ^ n) - lrot(n, 11);
+	chain_id = (chain_id ^ nonce) - lrot(nonce, 25);
+	n = (n ^ chain_id) - lrot(chain_id, 16);
+	nonce = (nonce ^ n) - lrot(n, 4);
+	chain_id = (chain_id ^ nonce) - lrot(nonce, 14);
+	n = (n ^ chain_id) - lrot(chain_id, 24);
+	return n;
+}
+
+uint32_t calc_aux_merkle_slot(uint32_t nonce, struct work_aux* auxwork) {
+	return calc_merkle_slot_namecoin(nonce, auxwork->chain_id);
+}
+
 bool layout_aux_merkle_tree(unsigned int num_chains) {
 	unsigned int i;
 	bool success = false;
-	for(num_merkle_slots = num_chains; num_merkle_slots < 256 && !success; num_merkle_slots++) {
+	for(aux_merkle_depth = 0; aux_merkle_depth < 10 && !success; aux_merkle_depth++) {
+		unsigned int num_merkle_slots = 1 << aux_merkle_depth;
+		if(num_chains > num_merkle_slots)
+			continue;
+
 		for(aux_merkle_nonce = 0; aux_merkle_nonce < 1000 && !success; aux_merkle_nonce++) {
 			printf("DEBUG: trying %u slots with nonce %u\n", num_merkle_slots, aux_merkle_nonce);
 			char merkle_used[num_merkle_slots];
 			memset(merkle_used, 0, num_merkle_slots);
 			success = true;
 			for(i = 0; i < num_chains; i++) {
-				unsigned int slot = calc_chain_merkle_slot(aux_merkle_nonce, current_work->auxworks[i]->chain_id) % num_merkle_slots;
+				unsigned int slot = calc_aux_merkle_slot(aux_merkle_nonce, current_work->auxworks[i]) & (num_merkle_slots - 1);
 				if(merkle_used[slot])
 					success = false;
 				merkle_used[slot] = 1;
@@ -626,13 +648,6 @@ bool layout_aux_merkle_tree(unsigned int num_chains) {
 	if(success)
 		need_merkle_relayout = 0;
 	return success;
-}
-
-unsigned int calc_merkle_branch_len(unsigned int merkle_size) {
-	unsigned int n = 0;
-	for(; merkle_size > 1; merkle_size = (merkle_size + 1) / 2)
-		n++;
-	return n;
 }
 
 static void reverse_copy_hash(unsigned char *dest, unsigned char *src)
@@ -657,37 +672,28 @@ void get_merkle_branch(unsigned char *merkle, unsigned int len, unsigned int idx
 
 void build_aux_merkle_tree(unsigned int num_chains, unsigned char auxmerkleroot[32])
 {
-	current_work->aux_merkle_len = num_merkle_slots;
+	current_work->aux_merkle_depth = aux_merkle_depth;
 	current_work->aux_merkle_nonce = aux_merkle_nonce;
 	if(num_chains == 0)
 	{
 		memset(auxmerkleroot, 0, 32);
-	} else if(num_chains == 1) {
-		memcpy(auxmerkleroot, current_work->auxworks[0]->hash, 32);
 	} else {
 		unsigned int i, j, n; unsigned char tmp[32];
 		unsigned char* merkle_next;
-		current_work->aux_merkle = calloc(num_merkle_slots*2, 32);
-		merkle_next = current_work->aux_merkle + num_merkle_slots*32;
+		n = 1 << aux_merkle_depth;
+		current_work->aux_merkle = calloc(n*2, 32);
+		merkle_next = current_work->aux_merkle + n*32;
 		for(i = 0; i < num_chains; i++) {
-			j = calc_chain_merkle_slot(aux_merkle_nonce, current_work->auxworks[i]->chain_id) % num_merkle_slots;
+			j = calc_aux_merkle_slot(aux_merkle_nonce, current_work->auxworks[i]) & (n - 1);
 			reverse_copy_hash(current_work->aux_merkle+32*j, current_work->auxworks[i]->hash);
 		}
-		for(i = 0, n = num_merkle_slots; n > 1; n = (n + 1) / 2) {
+		for(i = 0; n > 1; n = (n + 1) / 2) {
 			for(j = 0; j < n / 2; j++) {
 				SHA256(current_work->aux_merkle+i*32+j*64, 64, tmp);
 				SHA256(tmp, 32, merkle_next);
 				merkle_next += 32;
 			}
-			if(n & 1) {
-				unsigned char tmp2[64];
-				memcpy(tmp2, current_work->aux_merkle+i*32+j*64, 32);
-				memcpy(tmp2+32, current_work->aux_merkle+i*32+j*64, 32);
-				SHA256(tmp2, 64, tmp);
-				SHA256(tmp, 32, merkle_next);
-				merkle_next += 32;
-			}
-			j += n;
+			i += n;
 		}
 		reverse_copy_hash(auxmerkleroot, merkle_next - 32);
 		printf("DEBUG: aux merkle\n");
@@ -744,13 +750,14 @@ bool fetch_new_work(void)
 			current_work->auxworks[num_chains++] = auxwork;
 		}
 
-		if(num_chains > 1 && need_merkle_relayout) {
+		if(num_chains >= 1 && need_merkle_relayout) {
 			layout_aux_merkle_tree(num_chains);
 		}
 
 		build_aux_merkle_tree(num_chains, auxmerkleroot);
 		
-		if(!amend_coinbase(current_work, auxmerkleroot, num_merkle_slots, aux_merkle_nonce)) {
+		if(!amend_coinbase(current_work, auxmerkleroot, num_chains ? (1 << aux_merkle_depth) : 0, 
+				   aux_merkle_nonce)) {
 			work_src_decref(current_work);
 			current_work = NULL;
 			return false;
@@ -818,10 +825,9 @@ static bool submit_work_aux(const char *remote_host, const char *auth_user,
 	json_t *val; int is_success = 0;
 	char *request_str, *auxblock_hex, *auxpow_hex;
 	unsigned char* auxpow, *p;
-	unsigned int aux_merkle_len = calc_merkle_branch_len(work->aux_merkle_len);
 	unsigned int auxpow_len = work->coinbase_len + 32 + 1 + 32*work->merkle_len +
-		4 + 1 + 32*aux_merkle_len + 4 + 80;
-	uint32_t aux_merkle_slot = calc_chain_merkle_slot(work->aux_merkle_nonce, auxwork->chain_id) % work->aux_merkle_len;
+		4 + 1 + 32*work->aux_merkle_depth + 4 + 80;
+	uint32_t aux_merkle_slot = calc_aux_merkle_slot(work->aux_merkle_nonce, auxwork) & ((1 << work->aux_merkle_depth) - 1);
 	if(work->merkle_len > 32) 
 		return false;
 	
@@ -850,10 +856,10 @@ static bool submit_work_aux(const char *remote_host, const char *auth_user,
 	memcpy(p, work->merkle, 32*work->merkle_len);
 	p += 32*work->merkle_len;
 	memset(p, 0, 4); // index of coinbase TX, currently always 0
-	p[4] = aux_merkle_len; // aux chain merkle branch length
+	p[4] = work->aux_merkle_depth; // aux chain merkle branch length
 	p += 5;
-	get_merkle_branch(work->aux_merkle, work->aux_merkle_len, aux_merkle_slot, p);
-	p += 32*aux_merkle_len;
+	get_merkle_branch(work->aux_merkle, 1 << work->aux_merkle_depth, aux_merkle_slot, p);
+	p += 32*work->aux_merkle_depth;
 	// FIXME: aux chain merkle branch goes here
 	memcpy(p, &aux_merkle_slot, 4); // FIXME: aux chain merkle index goes here
 	memcpy(p+4, data, 80); // parent block
