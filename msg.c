@@ -930,6 +930,11 @@ static bool submit_work(const char *remote_host, const char *auth_user,
 		return true;
 	}
 
+	if(work) {
+		/* set the nonce in work->coinbase to match this work item */
+		set_our_nonce(work, our_nonce);
+	}
+
 	/* try submitting work to any aux chains */
 	/* FIXME: we want to do this even if it's stale on the main chain */
 	if(work && work->auxworks) {
@@ -955,11 +960,10 @@ static bool submit_work(const char *remote_host, const char *auth_user,
 		char *hexstr_orig = bin2hex(work->data, 128);
 		char *coinbase_hex;
 		char *request_str;
-		set_our_nonce(work, our_nonce);
 		coinbase_hex = bin2hex(work->coinbase, work->coinbase_len);
 		request_str = malloc(80+256+work->coinbase_len*2);
 		
-		// copy across nTime and nonce
+		/* copy across nTime and nonce */
 		memcpy(hexstr_orig+136, hexstr+136, 24);
 
 		sprintf(request_str, 

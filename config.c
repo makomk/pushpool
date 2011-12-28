@@ -339,6 +339,7 @@ static void parse_auxchains(const json_t *auxchains)
 			exit(1);
 		}
 
+		aux->chain_id = -1;
 		aux->rpc_url = strdup(rpcurl);
 
 		if (asprintf(&aux->rpc_userpass, "%s:%s", rpcuser, rpcpass) < 0) {
