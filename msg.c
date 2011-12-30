@@ -465,7 +465,6 @@ static bool amend_coinbase(struct work_src *work, unsigned char *auxmerkleroot,
 	memcpy(new_coinbase, work->coinbase, script_end);
 	memcpy(new_coinbase+script_end+size_increase, work->coinbase+script_end,
 	       work->coinbase_len - script_end);
-	work->ournonce_off = script_end+1;
 	work->script_len += size_increase;
 	new_coinbase[41] = work->script_len;
 
@@ -481,6 +480,7 @@ static bool amend_coinbase(struct work_src *work, unsigned char *auxmerkleroot,
 	}
 
 	// add the extranonce
+	work->ournonce_off = script_end+1;
 	new_coinbase[script_end] = 0x4;
 	memset(new_coinbase+script_end+1, 0, 4);
 	
